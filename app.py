@@ -113,15 +113,38 @@ def api_google_fit_fetch():
     steps_res = requests.post(url, headers=headers, json={**payload, "aggregateBy": [{"dataTypeName": "com.google.step_count.delta"}]})
     total_steps = _sum_fit_values(steps_res.json()) if steps_res.ok else 0
 
-    cal_res = requests.post(url, headers=headers, json={**payload, "aggregateBy": [{"dataTypeName": "com.google.calories.expended"}]})
+    cal_res = requests.post(
+        url,
+        headers=headers,
+        json={**payload, "aggregateBy": [{"dataTypeName": "com.google.calories.expended"}]},
+    )
     total_calories = _sum_fit_values(cal_res.json(), use_float=True) if cal_res.ok else 0.0
 
-    _store_fitness_record("google_fit", total_steps, total_calories, day, email=data.get("email"), active_calories=None, total_calories=total_calories)
+    bmr_res = requests.post(
+        url,
+        headers=headers,
+        json={**payload, "aggregateBy": [{"dataTypeName": "com.google.calories.bmr"}]},
+    )
+    basal_calories = _sum_fit_values(bmr_res.json(), use_float=True) if bmr_res.ok else 0.0
+
+    active_calories = max(0.0, total_calories - basal_calories) if basal_calories > 0 else 0.0
+    calories_display = active_calories if active_calories > 0 else total_calories
+
+    _store_fitness_record(
+        "google_fit",
+        total_steps,
+        calories_display,
+        day,
+        email=data.get("email"),
+        active_calories=active_calories,
+        total_calories=total_calories,
+    )
     return jsonify({
         "source": "google_fit", "steps": total_steps,
-        "calories": round(total_calories, 1),
-        "active_calories": None,
+        "calories": round(calories_display, 1),
+        "active_calories": round(active_calories, 1),
         "total_calories": round(total_calories, 1),
+        "basal_calories": round(basal_calories, 1),
         "date": day,
     })
 
@@ -158,8 +181,20 @@ def api_fitness_history():
         return jsonify({"records": [], "error": "MongoDB not configured"})
     q = {"date": request.args.get("date")} if request.args.get("date") else {}
     limit = min(int(request.args.get("limit", 30)), 100)
+
+    # Return only the latest record per day (latest updated_at first).
+    by_day = {}
+    for doc in _fitness_collection.find(q).sort([("date", -1), ("updated_at", -1)]):
+        day = doc.get("date")
+        if not day or day in by_day:
+            continue
+        by_day[day] = doc
+        if len(by_day) >= limit:
+            break
+
     records = []
-    for doc in _fitness_collection.find(q).sort("date", -1).limit(limit):
+    for day in sorted(by_day.keys(), reverse=True):
+        doc = by_day[day]
         doc.pop("_id", None)
         records.append(doc)
     return jsonify({"records": records})
